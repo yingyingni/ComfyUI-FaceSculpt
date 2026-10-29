@@ -1,0 +1,31 @@
+{
+  "src": {
+    "class_type": "LoadImage",
+    "inputs": { "image": "your_face.jpg" },
+    "_meta": { "title": "人脸照片（正面清晰人脸）" }
+  },
+  "recon": {
+    "class_type": "FaceVerseRecon",
+    "inputs": { "image": ["src", 0], "device": "cuda", "render": false },
+    "_meta": { "title": "FaceVerse V4 三维人脸重建（ResNet50 回归 621 维参数）" }
+  },
+  "sculpt": {
+    "class_type": "FaceVerseSculpt",
+    "inputs": {
+      "image": ["src", 0],
+      "fvdata": ["recon", 0],
+      "shape_scale": 0.0,
+      "nose_lift": 0.5,
+      "jaw_slim": 0.4,
+      "chin_length": 0.0,
+      "shape_dim": -1,
+      "shape_delta": 0.0,
+      "blend_feather": 0.1
+    },
+    "_meta": { "title": "FaceVerse 骨相微调（3D 重建→参数形变→投影锚点网格扭曲原图，纹理零损失）" }
+  },
+  "save": {
+    "class_type": "SaveImage",
+    "inputs": { "filename_prefix": "face_sculpt_3d", "images": ["sculpt", 0] }
+  }
+}

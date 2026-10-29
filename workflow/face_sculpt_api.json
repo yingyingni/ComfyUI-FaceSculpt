@@ -1,0 +1,37 @@
+{
+  "src": {
+    "class_type": "LoadImage",
+    "inputs": { "image": "your_face.jpg" },
+    "_meta": { "title": "人脸照片（正面清晰人脸）" }
+  },
+  "lm": {
+    "class_type": "FaceSculptLandmarks",
+    "inputs": { "image": ["src", 0], "draw": false },
+    "_meta": { "title": "MediaPipe 478 关键点检测" }
+  },
+  "edit": {
+    "class_type": "FaceSculptEdit",
+    "inputs": {
+      "image": ["src", 0],
+      "landmarks": ["lm", 0],
+      "nose_lift": 0.3,
+      "nose_tip_up": 0.0,
+      "nose_shrink": 0.0,
+      "eye_inner": 0.0,
+      "eye_big": 0.0,
+      "lip_full": 0.0,
+      "mouth_width": 0.0,
+      "jaw_slim": 0.2,
+      "cheek_slim": 0.0,
+      "brow_lift": 0.0,
+      "chin_down": 0.0,
+      "chin_shrink": 0.0,
+      "blend_feather": 0.08
+    },
+    "_meta": { "title": "人脸参数微调（区域加权位移+三角仿射扭曲，纯像素位移锁身份）" }
+  },
+  "save": {
+    "class_type": "SaveImage",
+    "inputs": { "filename_prefix": "face_sculpt", "images": ["edit", 0] }
+  }
+}
