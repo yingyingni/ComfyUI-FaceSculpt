@@ -244,7 +244,9 @@ def _find_fv_dir():
         os.environ.get("FACE_VERSE_DIR", ""),
     ]
     for c in cands:
-        if c and os.path.isfile(os.path.join(c, "faceversev4.py")):
+        # 官方仓库内 faceversev4 是子包目录，兼容文件/目录两种形态
+        if c and (os.path.isfile(os.path.join(c, "faceversev4.py"))
+                  or os.path.isdir(os.path.join(c, "faceversev4"))):
             return c
     return None
 
@@ -480,41 +482,74 @@ class FaceVerseSculpt:
             d = np.linalg.norm(new_proj - c, axis=1)
             return np.where(d < radius)[0], c
         unit = 20.0  # 像素基准
+        def _weighted(sel, c, vec, radius):
+            """组内高斯衰减位移：稠密场插值下硬边界会产生折痕"""
+            if not len(sel) or c is None:
+                return
+            d = np.linalg.norm(new_proj[sel] - c, axis=1)
+            wts = np.exp(-(d ** 2) / (2 * (radius * 0.55) ** 2))
+            deltas3d[sel] += np.asarray(vec, dtype=np.float32) * wts[:, None]
         if edits.get("nose_lift"):
-            sel, _ = vgroup(REGIONS["nose_bridge"] + REGIONS["nose_tip"], 60)
-            if len(sel):
-                deltas3d[sel, 1] -= edits["nose_lift"] * unit
+            sel, c = vgroup(REGIONS["nose_bridge"] + REGIONS["nose_tip"], 60)
+            _weighted(sel, c, np.array([0.0, -edits["nose_lift"] * unit], np.float32), 60)
         if edits.get("jaw_slim"):
             sel, c = vgroup(REGIONS["jaw_line"], 140)
             if len(sel):
                 cx = new_proj[:, 0].mean()
                 side = np.where(new_proj[sel, 0] < cx, 1.0, -1.0)
-                deltas3d[sel, 0] -= side * edits["jaw_slim"] * unit
+                vec = np.stack([-side * edits["jaw_slim"] * unit,
+                                np.zeros(len(sel), np.float32)], axis=1)
+                _weighted(sel, c, vec, 140)
         if edits.get("chin_length"):
-            sel, _ = vgroup(REGIONS["chin"], 60)
-            if len(sel):
-                deltas3d[sel, 1] += edits["chin_length"] * unit
+            sel, c = vgroup(REGIONS["chin"], 60)
+            _weighted(sel, c, np.array([0.0, edits["chin_length"] * unit], np.float32), 60)
 
         dst = new_proj + deltas3d
-        # 锚点抽稀：全量 ~2.8 万顶点逐三角 warp 太慢（10min+），改用
-        # mediapipe 对应锚点(468) + 图像边界固定点 → Delaunay ~900 三角，秒级
         w, h = meta["w"], meta["h"]
-        if kp_idx.size:
-            anchors = kp_idx[(kp_idx >= 0) & (kp_idx < len(new_proj))]
-        else:
-            anchors = np.arange(0, len(new_proj), max(1, len(new_proj) // 450))
-        border = np.array([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1],
-                           [w / 2, 0], [w / 2, h - 1], [0, h / 2], [w - 1, h / 2]],
-                          dtype=np.float32)
-        src = np.vstack([old_proj[anchors], border])
-        dst_sub = np.vstack([dst[anchors], border])
-        from scipy.spatial import Delaunay
-        tri_sub = Delaunay(src.astype(np.float64)).simplices.astype(np.int64)
-        out = _mesh_affine_warp(img_rgb, src, dst_sub, tri_sub)
-        out = feather_blend(img_rgb, out, src, blend_feather)
-        mesh_json = json.dumps({"pts": dst_sub[:: max(1, len(dst_sub) // 480)].tolist(),
+        # 全量顶点 delta 场 + FaceVerse 固定三角拓扑 → 稠密插值 + 一次 remap
+        # 精度=全网格无三角线性化损失，速度=向量化秒级
+        delta_total = dst - old_proj
+        tri_fv = np.asarray(fvd["tri"], dtype=np.int64)
+        out = _dense_field_warp(img_rgb, delta_total, tri_fv, dst)
+        out = feather_blend(img_rgb, out,
+                            old_proj[:: max(1, len(old_proj) // 300)], blend_feather)
+        mesh_json = json.dumps({"pts": dst[:: max(1, len(dst) // 480)].tolist(),
                                 "w": w, "h": h})
         return (_to_tensor(out), mesh_json)
+
+
+def _dense_field_warp(img, delta, tri, dst_pts):
+    """顶点 delta 场经模型三角拓扑稠密插值 → cv2.remap 一次成型。
+    全量顶点参与（无锚点抽稀的信息损失），向量化实现秒级完成。"""
+    import matplotlib.tri as mtri
+    h, w = img.shape[:2]
+    # 输出域建在 dst 顶点位置上：输出像素 p 的采样源 = p - delta(p)
+    tri_xy = mtri.Triangulation(dst_pts[:, 0], dst_pts[:, 1], tri)
+    # matplotlib 自带三网线插值器直接吃 fvd 拓扑，免 28k 点 Delaunay
+    fx = mtri.LinearTriInterpolator(tri_xy, np.asarray(delta[:, 0], dtype=np.float64))
+    fy = mtri.LinearTriInterpolator(tri_xy, np.asarray(delta[:, 1], dtype=np.float64))
+    # 仅在 dst 外扩包围盒内评估，盒外恒等映射
+    x0, y0 = np.floor(dst_pts.min(axis=0)).astype(int) - 4
+    x1, y1 = np.ceil(dst_pts.max(axis=0)).astype(int) + 4
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(w, int(x1)), min(h, int(y1))
+    gx, gy = np.meshgrid(np.arange(x0, x1, dtype=np.float64),
+                         np.arange(y0, y1, dtype=np.float64))
+    # LinearTriInterpolator 返回 MaskedArray，凸包外置 NaN 后按恒等处理
+    dx = np.ma.filled(fx(gx, gy), np.nan)
+    dy = np.ma.filled(fy(gx, gy), np.nan)
+    sx = (gx - dx).astype(np.float32)
+    sy = (gy - dy).astype(np.float32)
+    bad = ~np.isfinite(sx) | ~np.isfinite(sy)
+    sx[bad] = gx[bad]
+    sy[bad] = gy[bad]
+    # 全场映射：框外恒等
+    mx = np.tile(np.arange(w, dtype=np.float32), (h, 1))
+    my = np.tile(np.arange(h, dtype=np.float32)[:, None], (1, w))
+    mx[y0:y1, x0:x1] = sx
+    my[y0:y1, x0:x1] = sy
+    return cv2.remap(img, mx, my, cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REFLECT_101)
 
 
 def _mesh_affine_warp(img, src_pts, dst_pts, tri):
